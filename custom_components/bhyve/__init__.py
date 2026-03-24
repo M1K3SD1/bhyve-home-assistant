@@ -111,7 +111,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(update_listener))
+
+    # Remove devices that were deselected in options
+    configured_ids = set(entry.options.get(CONF_DEVICES, []))
+    if configured_ids:
+        all_device_ids = {str(d["id"]) for d in all_devices}
+        removed_device_ids = all_device_ids - configured_ids
+        if removed_device_ids:
+            await remove_devices_from_registry(hass, removed_device_ids)
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, client.stop)
 
@@ -133,30 +140,6 @@ async def remove_devices_from_registry(
                 device_registry.async_remove_device(device.id)
             except HomeAssistantError:
                 _LOGGER.exception("Failed to remove device %s from registry", device_id)
-
-
-async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload to update options and remove filtered devices."""
-    # Get the current client and all devices before reload
-    data = hass.data[DOMAIN].get(entry.entry_id)
-    if data:
-        client = data["client"]
-        try:
-            all_devices = await client.devices
-            # Get currently configured device IDs
-            configured_ids = set(entry.options.get(CONF_DEVICES, []))
-
-            # Find devices that were removed from configuration
-            all_device_ids = {str(d["id"]) for d in all_devices}
-            removed_device_ids = all_device_ids - configured_ids
-
-            if removed_device_ids:
-                # Remove devices from Home Assistant
-                await remove_devices_from_registry(hass, removed_device_ids)
-        except (BHyveError, KeyError) as err:
-            _LOGGER.warning("Error checking for removed devices: %s", err)
-
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
