@@ -1,0 +1,198 @@
+"""Support for Orbit BHyve irrigation devices."""
+
+import logging
+from typing import Any
+
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import (
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    EVENT_HOMEASSISTANT_STOP,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from custom_components.bhyve.pybhyve.typings import BHyveDevice
+
+from .const import (
+    CONF_DEVICES,
+    DOMAIN,
+    EVENT_PROGRAM_CHANGED,
+    LOGGER,
+    MANUFACTURER,
+)
+from .coordinator import BHyveDataUpdateCoordinator
+from .pybhyve import BHyveClient
+from .pybhyve.errors import AuthenticationError, BHyveError
+from .util import filter_configured_devices
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.VALVE,
+]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the BHyve component from YAML."""
+    if DOMAIN not in config:
+        return True
+
+    hass.async_create_task(
+        hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data=config[DOMAIN],
+        )
+    )
+
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up BHyve from a config entry."""
+    client = BHyveClient(
+        entry.data[CONF_USERNAME],
+        entry.data[CONF_PASSWORD],
+        session=async_get_clientsession(hass),
+    )
+
+    try:
+        if await client.login() is False:
+            msg = "Invalid credentials"
+            raise ConfigEntryAuthFailed(msg)
+    except AuthenticationError as err:
+        raise ConfigEntryAuthFailed(err) from err
+    except BHyveError as err:
+        raise ConfigEntryNotReady(err) from err
+
+    # Create coordinator
+    coordinator = BHyveDataUpdateCoordinator(hass, client, entry)
+
+    # Initial data fetch
+    await coordinator.async_config_entry_first_refresh()
+
+    # WebSocket callback routes to coordinator
+    async def async_update_callback(data: dict) -> None:
+        event = data.get("event")
+
+        # Route to coordinator - coordinator handles all entity updates
+        if event == EVENT_PROGRAM_CHANGED:
+            await coordinator.async_handle_program_event(data)
+        else:
+            await coordinator.async_handle_device_event(data)
+
+    # Start WebSocket
+    client.listen(hass.loop, async_update_callback)
+
+    # Filter the device list to those that are enabled in options
+    all_devices = await client.devices
+    programs = await client.timer_programs
+    devices = filter_configured_devices(entry, all_devices)
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "client": client,
+        "coordinator": coordinator,
+        "devices": devices,
+        "programs": programs,
+    }
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Remove devices that were deselected in options
+    configured_ids = set(entry.options.get(CONF_DEVICES, []))
+    if configured_ids:
+        all_device_ids = {str(d["id"]) for d in all_devices}
+        removed_device_ids = all_device_ids - configured_ids
+        if removed_device_ids:
+            await remove_devices_from_registry(hass, removed_device_ids)
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, client.stop)
+
+    return True
+
+
+async def remove_devices_from_registry(
+    hass: HomeAssistant, device_ids: set[str]
+) -> None:
+    """Remove devices from registry by domain-specific string identifiers."""
+    device_registry = dr.async_get(hass)
+
+    for device_id in device_ids:
+        # Find the device in the registry by its identifiers
+        device = device_registry.async_get_device(identifiers={(DOMAIN, device_id)})
+        if device:
+            _LOGGER.info("Removing device %s from registry", device_id)
+            try:
+                device_registry.async_remove_device(device.id)
+            except HomeAssistantError:
+                _LOGGER.exception("Failed to remove device %s from registry", device_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        hass.data[DOMAIN].pop(entry.entry_id)
+
+    return unload_ok
+
+
+class BHyveCoordinatorEntity(CoordinatorEntity[BHyveDataUpdateCoordinator]):
+    """Base entity for coordinator-based B-hyve entities."""
+
+    def __init__(
+        self,
+        coordinator: BHyveDataUpdateCoordinator,
+        device: BHyveDevice,
+    ) -> None:
+        """Initialize the entity."""
+        super().__init__(coordinator)
+        self._device_id = device.get("id", "")
+        self._device_type = device.get("type", "")
+        self._device_name = device.get("name", "")
+        self._mac_address = device.get("mac_address")
+
+        # Device info for grouping
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._device_id)},
+            manufacturer=MANUFACTURER,
+            configuration_url=f"https://techsupport.orbitbhyve.com/dashboard/support/device/{self._device_id}",
+            name=self._device_name,
+            model=device.get("hardware_version"),
+            hw_version=device.get("hardware_version"),
+            sw_version=device.get("firmware_version"),
+        )
+
+        LOGGER.debug(
+            "Creating %s: %s - %s",
+            self.__class__.__name__,
+            self._device_name,
+            self._device_type,
+        )
+
+    @property
+    def device_data(self) -> dict[str, Any]:
+        """Get device data from coordinator."""
+        return (
+            self.coordinator.data.get("devices", {})
+            .get(self._device_id, {})
+            .get("device", {})
+        )
+
+    @property
+    def available(self) -> bool:
+        """Entity available when device connected."""
+        return self.device_data.get("is_connected", False)
