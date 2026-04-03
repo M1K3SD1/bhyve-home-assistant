@@ -1,2 +1,24 @@
+# artifacts
 __pycache__/
 *.pyc
+.pytest*
+*.egg-info
+*/build/*
+*/dist/*
+.DS_Store
+
+
+# misc
+.coverage
+.vscode
+coverage.xml
+.ruff_cache
+
+debug/[0-9]*
+debug/sync
+
+# Home Assistant configuration
+config/*
+!config/configuration.yaml
+core
+.venv
